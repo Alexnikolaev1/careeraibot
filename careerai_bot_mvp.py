@@ -126,6 +126,93 @@ user_lock = asyncio.Lock()
 # Простой кэш (уменьшает расходы, но не является персистентным)
 analysis_cache: Dict[str, Dict[str, Any]] = {}  # {cache_key: {"expires_at": datetime, "value": dict}}
 
+# ============================================================================
+# АНАЛИТИКА (простая система отслеживания событий)
+# ============================================================================
+
+# События для отслеживания:
+# - user_started: пользователь запустил бота
+# - resume_analyzed: пользователь проанализировал резюме
+# - premium_clicked: пользователь нажал на премиум
+# - tailor_used: использовал оптимизацию под вакансию
+# - improve_used: использовал черновик
+# - error_occurred: произошла ошибка
+
+analytics_events: list[Dict[str, Any]] = []  # Список всех событий
+analytics_lock = asyncio.Lock()
+
+def track_event(event_name: str, user_id: int, metadata: Optional[Dict[str, Any]] = None):
+    """
+    Логирование события для аналитики
+    
+    Args:
+        event_name: название события (user_started, resume_analyzed и т.д.)
+        user_id: ID пользователя
+        metadata: дополнительные данные (опционально)
+    """
+    event = {
+        "event": event_name,
+        "user_id": user_id,
+        "timestamp": _now().isoformat(),
+        "date": _today_key(),
+        "metadata": metadata or {}
+    }
+    
+    # Логируем в консоль (для Vercel это попадет в Function Logs)
+    logger.info(f"ANALYTICS: {event_name} | user_id={user_id} | metadata={metadata}")
+    
+    # Сохраняем в память (для простого дашборда)
+    # ВАЖНО: на Vercel это сбросится при перезапуске, но для MVP достаточно
+    analytics_events.append(event)
+    
+    # Ограничиваем размер списка (храним последние 10000 событий)
+    if len(analytics_events) > 10000:
+        analytics_events.pop(0)
+
+
+def get_analytics_stats() -> Dict[str, Any]:
+    """
+    Получить базовую статистику из событий
+    
+    Возвращает:
+        - total_users: всего уникальных пользователей
+        - daily_active_users: активных пользователей сегодня
+        - events_today: событий сегодня
+        - events_by_type: события по типам
+        - conversion_rate: конверсия в анализ резюме (из тех, кто запустил бота)
+    """
+    today = _today_key()
+    
+    # Фильтруем события за сегодня
+    events_today = [e for e in analytics_events if e.get("date") == today]
+    
+    # Уникальные пользователи за все время
+    all_user_ids = set(e["user_id"] for e in analytics_events)
+    
+    # Уникальные пользователи сегодня
+    today_user_ids = set(e["user_id"] for e in events_today)
+    
+    # События по типам
+    events_by_type: Dict[str, int] = {}
+    for event in analytics_events:
+        event_name = event.get("event", "unknown")
+        events_by_type[event_name] = events_by_type.get(event_name, 0) + 1
+    
+    # Конверсия: сколько из тех, кто запустил бота, проанализировали резюме
+    started_count = events_by_type.get("user_started", 0)
+    analyzed_count = events_by_type.get("resume_analyzed", 0)
+    conversion_rate = (analyzed_count / started_count * 100) if started_count > 0 else 0
+    
+    return {
+        "total_users": len(all_user_ids),
+        "daily_active_users": len(today_user_ids),
+        "events_today": len(events_today),
+        "total_events": len(analytics_events),
+        "events_by_type": events_by_type,
+        "conversion_rate": round(conversion_rate, 2),
+        "last_updated": _now().isoformat()
+    }
+
 
 def h(text: str) -> str:
     """HTML-escape для безопасной выдачи в Telegram (ParseMode.HTML)."""
@@ -150,7 +237,14 @@ def get_bot() -> Bot:
     # ВАЖНО: не передаем parse_mode напрямую в Bot(), только через DefaultBotProperties
     logger.info("Initializing Bot instance...")
     try:
-        bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        # Увеличиваем таймауты для работы на Vercel (serverless может быть медленнее)
+        # Используем request_timeout параметр для увеличения таймаутов запросов
+        bot = Bot(
+            token=token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            # Увеличиваем таймаут запросов до 30 секунд для Vercel
+            # Это поможет избежать таймаутов при медленных соединениях
+        )
         logger.info("Bot initialized successfully")
     except Exception as e:
         logger.exception(f"Bot initialization error: {type(e).__name__}: {e}")
@@ -744,6 +838,13 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     state = get_user_state(user_id)
     
+    # Логируем событие: пользователь запустил бота
+    track_event("user_started", user_id, {
+        "username": message.from_user.username,
+        "first_name": message.from_user.first_name,
+        "is_new_user": state.get("registered_at") is None
+    })
+    
     welcome_text = """👋 <b>Добро пожаловать в CareerAI!</b>
 
 🎯 <b>Ваш личный карьерный ассистент с ИИ</b>
@@ -972,6 +1073,14 @@ async def handle_resume(message: types.Message):
         await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
         try:
             result = await resume_analyzer.tailor_to_job(resume_text, job_text, user_id)
+            
+            # Логируем событие: пользователь успешно оптимизировал резюме под вакансию
+            track_event("tailor_completed", user_id, {
+                "resume_length": len(resume_text),
+                "job_text_length": len(job_text),
+                "fit_score": result.get("fit_score", 0)
+            })
+            
             user_ctx.setdefault(user_id, {})["mode"] = "idle"
 
             text = (
@@ -1019,6 +1128,13 @@ async def handle_resume(message: types.Message):
         # Анализ резюме
         analysis = await resume_analyzer.analyze_resume(resume_text, user_id)
         
+        # Логируем событие: пользователь проанализировал резюме
+        track_event("resume_analyzed", user_id, {
+            "resume_length": len(resume_text),
+            "ats_score": analysis.get("ats_score", 0),
+            "has_file": hasattr(message, "document") and message.document is not None
+        })
+        
         # Форматирование результата
         result_text = f"""✅ <b>Анализ завершен!</b>
 
@@ -1057,6 +1173,15 @@ async def handle_resume(message: types.Message):
         error_type = type(e).__name__
         error_msg = str(e)
         logger.exception(f"[{rid}] Error analyzing resume: {error_type}: {error_msg}")
+        
+        # Логируем событие: произошла ошибка
+        track_event("error_occurred", user_id, {
+            "error_type": error_type,
+            "error_message": error_msg[:200],
+            "error_id": rid,
+            "action": "resume_analysis"
+        })
+        
         # Более информативное сообщение об ошибке
         user_friendly_msg = (
             "😔 Произошла ошибка при анализе.\n\n"
@@ -1080,6 +1205,11 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "@YourCareerAIBot").strip() or "@YourCa
 @dp.callback_query(lambda c: c.data == "premium_info")
 async def callback_premium_info(callback: types.CallbackQuery):
     """Показать информацию о премиум"""
+    user_id = callback.from_user.id
+    
+    # Логируем событие: пользователь нажал на премиум
+    track_event("premium_clicked", user_id)
+    
     await callback.message.edit_text(
         "💎 <b>CareerAI Premium - скоро!</b>\n\n"
         "Мы работаем над запуском премиум-функций.\n"
@@ -1104,6 +1234,10 @@ async def callback_notify_launch(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "tailor_start")
 async def callback_tailor_start(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    
+    # Логируем событие: пользователь начал оптимизацию под вакансию
+    track_event("tailor_started", user_id)
+    
     if not user_ctx.get(user_id, {}).get("last_resume_text"):
         await callback.message.answer("Сначала пришлите резюме (текстом или файлом), затем нажмите «🎯 Под вакансию».")
         await callback.answer()
@@ -1120,6 +1254,10 @@ async def callback_tailor_start(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "improve_start")
 async def callback_improve_start(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    
+    # Логируем событие: пользователь начал создание черновика
+    track_event("improve_started", user_id)
+    
     rid = uuid.uuid4().hex[:8]
     resume_text = user_ctx.get(user_id, {}).get("last_resume_text")
     if not resume_text:
@@ -1131,6 +1269,13 @@ async def callback_improve_start(callback: types.CallbackQuery):
     await bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.TYPING)
     try:
         improved = await resume_analyzer.improve_resume_text(resume_text, user_id)
+        
+        # Логируем событие: пользователь успешно создал черновик
+        track_event("improve_completed", user_id, {
+            "resume_length": len(resume_text),
+            "improved_length": len(improved)
+        })
+        
         # Telegram лимит: лучше отдавать файлом
         file_bytes = improved.encode("utf-8", errors="ignore")
         document = BufferedInputFile(file_bytes, filename="resume_draft.txt")
@@ -1244,17 +1389,44 @@ async def telegram_webhook(request: Request):
         # Читаем JSON напрямую
         update = await request.json()
         update_id = update.get('update_id', 'N/A')
-        logger.info(f"Webhook received: update_id={update_id}")
         
-        # ВАЖНО: Сначала отвечаем Telegram быстро, чтобы избежать таймаута
-        # Обработку делаем в фоне через create_task
+        # Определяем тип обновления для логирования
+        update_type = "unknown"
+        if "message" in update:
+            update_type = "message"
+            msg_text = update.get("message", {}).get("text", "")
+            logger.info(f"Webhook received: update_id={update_id}, type={update_type}, text={msg_text[:50]}")
+        elif "callback_query" in update:
+            update_type = "callback_query"
+            callback_data = update.get("callback_query", {}).get("data", "")
+            logger.info(f"Webhook received: update_id={update_id}, type={update_type}, data={callback_data}")
+        else:
+            logger.info(f"Webhook received: update_id={update_id}, type={update_type}")
+        
+        # ВАЖНО: На Vercel serverless функции завершаются сразу после ответа,
+        # поэтому фоновые задачи (create_task) не успевают выполниться.
+        # Обрабатываем обновление синхронно, но быстро отвечаем Telegram.
         telegram_update = types.Update(**update)
         b = get_bot()
         
-        # Запускаем обработку в фоне (не ждем завершения)
-        asyncio.create_task(dp.feed_update(b, telegram_update))
+        # Запускаем обработку в фоне, но ждем её завершения
+        # Используем asyncio.wait_for с таймаутом, чтобы не блокировать слишком долго
+        try:
+            # Обрабатываем с таймаутом 25 секунд (Vercel Pro план дает до 60 сек)
+            await asyncio.wait_for(
+                dp.feed_update(b, telegram_update),
+                timeout=25.0
+            )
+            logger.info(f"Update {update_id} processed successfully")
+        except asyncio.TimeoutError:
+            logger.warning(f"Update {update_id} processing timeout (25s)")
+            # Если обработка заняла слишком долго, всё равно отвечаем Telegram успешно
+            # чтобы не получить повторную отправку
+        except Exception as e:
+            logger.exception(f"Error processing update {update_id}: {type(e).__name__}: {str(e)}")
+            # Продолжаем выполнение, чтобы вернуть успешный ответ Telegram
         
-        # Сразу возвращаем успешный ответ Telegram
+        # Возвращаем успешный ответ Telegram
         return {"ok": True}
     except ValueError as e:
         # Ошибки валидации данных от Telegram
@@ -1287,6 +1459,20 @@ async def health_check():
         "users": len(user_data),
         "timestamp": _now().isoformat(),
         "version": APP_VERSION,
+    }
+
+@app.get("/api/stats")
+async def analytics_stats():
+    """
+    Эндпоинт для просмотра аналитики
+    
+    Доступен по адресу: https://careeraibot.vercel.app/api/stats
+    """
+    stats = get_analytics_stats()
+    return {
+        "status": "ok",
+        "analytics": stats,
+        "note": "Данные хранятся в памяти и сбрасываются при перезапуске сервера"
     }
 
 # ============================================================================
