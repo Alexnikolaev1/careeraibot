@@ -1538,6 +1538,12 @@ def _format_improvements_legacy(items: list) -> str:
 # YOOKASSA WEBHOOK (уведомления о платежах)
 # ============================================================================
 
+@app.get("/api/yookassa-webhook")
+async def yookassa_webhook_get():
+    """GET — проверка доступности. YooKassa шлёт POST."""
+    return {"ok": True, "message": "YooKassa webhook, use POST for notifications"}
+
+
 @app.post("/api/yookassa-webhook")
 async def yookassa_webhook(request: Request):
     """Принимает уведомления от YooKassa (payment.succeeded и др.). Возвращаем 200 — подтверждение получения."""
