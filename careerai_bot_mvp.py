@@ -1535,6 +1535,22 @@ def _format_improvements_legacy(items: list) -> str:
     return "\n".join([f"{i+1}. {item}" for i, item in enumerate(items)])
 
 # ============================================================================
+# YOOKASSA WEBHOOK (уведомления о платежах)
+# ============================================================================
+
+@app.post("/api/yookassa-webhook")
+async def yookassa_webhook(request: Request):
+    """Принимает уведомления от YooKassa (payment.succeeded и др.). Возвращаем 200 — подтверждение получения."""
+    try:
+        body = await request.json()
+        event = body.get("event", "")
+        logger.info(f"YooKassa webhook: event={event}")
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+# ============================================================================
 # VERCEL WEBHOOK HANDLER
 # ============================================================================
 
