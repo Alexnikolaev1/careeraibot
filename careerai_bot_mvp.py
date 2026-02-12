@@ -20,13 +20,13 @@ try:
 except Exception:  # pragma: no cover
     load_dotenv = None  # type: ignore
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, LabeledPrice
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatAction
 
@@ -74,9 +74,22 @@ CLOUDFLARE_WORKER_URL = _normalize_base_url(
 )
 SUPPORT_HANDLE = os.getenv("SUPPORT_HANDLE", "@YourSupportBot").strip() or "@YourSupportBot"
 
-FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "3"))
-MAX_RESUME_CHARS_FREE = int(os.getenv("MAX_RESUME_CHARS_FREE", "3500"))
-MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(2 * 1024 * 1024)))  # 2MB
+# Платежи: токен от @BotFather (Payments). Если пусто — кнопка «Купить» не показывается.
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "").strip()
+# Цена премиума: сумма в минимальных единицах валюты (центы для USD, копейки для RUB)
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+PREMIUM_PRICE_CENTS = _env_int("PREMIUM_PRICE_CENTS", 999)  # 9.99 USD
+PREMIUM_CURRENCY = (os.getenv("PREMIUM_CURRENCY", "USD") or "USD").strip().upper()[:3]  # USD или RUB
+PREMIUM_DAYS = _env_int("PREMIUM_DAYS", 30)  # срок подписки в днях
+
+FREE_DAILY_LIMIT = _env_int("FREE_DAILY_LIMIT", 3)
+MAX_RESUME_CHARS_FREE = _env_int("MAX_RESUME_CHARS_FREE", 3500)
+MAX_FILE_BYTES = _env_int("MAX_FILE_BYTES", 2 * 1024 * 1024)  # 2MB
 
 
 # ============================================================================
@@ -126,6 +139,23 @@ user_lock = asyncio.Lock()
 # Простой кэш (уменьшает расходы, но не является персистентным)
 analysis_cache: Dict[str, Dict[str, Any]] = {}  # {cache_key: {"expires_at": datetime, "value": dict}}
 
+# Премиум-подписки: user_id -> дата окончания (UTC). В production — хранить в БД.
+premium_users: Dict[int, datetime] = {}  # {user_id: premium_until}
+
+def is_premium(user_id: int) -> bool:
+    """Проверка, есть ли у пользователя активная премиум-подписка"""
+    until = premium_users.get(user_id)
+    if until is None:
+        return False
+    if until < _now():
+        premium_users.pop(user_id, None)
+        return False
+    return True
+
+def set_premium_until(user_id: int, days: int = 30) -> None:
+    """Выдать премиум на указанное количество дней"""
+    premium_users[user_id] = _now() + timedelta(days=days)
+
 # ============================================================================
 # АНАЛИТИКА (простая система отслеживания событий)
 # ============================================================================
@@ -138,7 +168,7 @@ analysis_cache: Dict[str, Dict[str, Any]] = {}  # {cache_key: {"expires_at": dat
 # - improve_used: использовал черновик
 # - error_occurred: произошла ошибка
 
-analytics_events: list[Dict[str, Any]] = []  # Список всех событий
+analytics_events: List[Dict[str, Any]] = []  # Список всех событий
 analytics_lock = asyncio.Lock()
 
 def track_event(event_name: str, user_id: int, metadata: Optional[Dict[str, Any]] = None):
@@ -487,7 +517,9 @@ def reset_daily_limits():
         user_data[user_id]["requests_today"] = 0
 
 async def check_rate_limit(user_id: int) -> Tuple[bool, str]:
-    """Проверка лимитов: (allowed, message)"""
+    """Проверка лимитов: (allowed, message). Премиум-пользователи не ограничены."""
+    if is_premium(user_id):
+        return True, ""
     async with user_lock:
         state = get_user_state(user_id)
 
@@ -866,29 +898,33 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("premium"))
 async def cmd_premium(message: types.Message):
-    """Информация о премиум"""
+    """Информация о премиум и кнопка оплаты"""
+    user_id = message.from_user.id
     premium_text = """💎 <b>CareerAI Premium</b>
 
 <b>Что входит:</b>
 ✅ Неограниченные анализы резюме
-✅ Детальная ATS-оптимизация (100+ критериев)
-✅ Сравнение с топ-10% резюме в индустрии
-✅ Генерация сопроводительных писем
-✅ Симуляция собеседований с обратной связью
-✅ Приоритетная поддержка
-
-<b>Цена:</b> $9.99/месяц
-
-🎁 <b>Первые 3 дня БЕСПЛАТНО!</b>
-Без привязки карты. Отмена в любой момент.
-
-<i>Сейчас в разработке. Оставьте email для раннего доступа:</i>
-📧 hello@careerai.bot"""
+✅ Черновик и оптимизация под вакансию без лимитов
+✅ Приоритетная поддержка"""
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔔 Уведомить о запуске", callback_data="notify_launch")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
-    ])
+    if is_premium(user_id):
+        premium_text += "\n\n🎉 <b>У вас активна премиум-подписка.</b>"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
+        ])
+    elif PAYMENT_PROVIDER_TOKEN:
+        price_label = f"{PREMIUM_PRICE_CENTS / 100:.2f} USD" if PREMIUM_CURRENCY == "USD" else f"{PREMIUM_PRICE_CENTS / 100:.0f} ₽"
+        premium_text += f"\n\n<b>Цена:</b> {price_label} за {PREMIUM_DAYS} дней.\nОплата прямо в Telegram."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Купить Premium", callback_data="buy_premium")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
+        ])
+    else:
+        premium_text += "\n\n<i>Оплата скоро. Email для уведомления: hello@careerai.bot</i>"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔔 Уведомить о запуске", callback_data="notify_launch")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
+        ])
     
     await message.answer(premium_text, reply_markup=keyboard)
 
@@ -898,13 +934,13 @@ async def cmd_stats(message: types.Message):
     user_id = message.from_user.id
     state = get_user_state(user_id)
     
+    limit_text = "∞ (Премиум)" if is_premium(user_id) else f"{state['requests_today']}/{FREE_DAILY_LIMIT}"
     stats_text = f"""📊 <b>Ваша статистика</b>
 
 📅 С нами с: {state['registered_at'].strftime('%d.%m.%Y')}
-🔢 Запросов сегодня: {state['requests_today']}/{FREE_DAILY_LIMIT}
+🔢 Запросов сегодня: {limit_text}
 ⏱ Последний анализ: {state['last_request'].strftime('%H:%M') if state['last_request'] else 'Еще не было'}
-
-💡 <b>Совет:</b> Премиум-пользователи получают в 5 раз больше деталей!"""
+{"💎 Премиум активен" if is_premium(user_id) else "💡 /premium — неограниченные анализы"}"""
     
     await message.answer(stats_text)
 
@@ -1038,6 +1074,55 @@ async def _extract_resume_text_from_message(message: types.Message) -> Optional[
         return text or None
 
     raise ValueError("Неподдерживаемый формат. Отправьте PDF/DOCX/TXT или вставьте текст резюме.")
+
+
+# Обработчики платежей — регистрируем ДО общего @dp.message(), чтобы срабатывали первыми
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout: types.PreCheckoutQuery):
+    """Пользователь нажал «Оплатить» в счёте. Обязательно ответить answer_pre_checkout_query."""
+    try:
+        user_id = pre_checkout.from_user.id if pre_checkout.from_user else None
+        payload = (pre_checkout.invoice_payload or "").strip()
+        logger.info(f"pre_checkout_query: user_id={user_id}, payload={payload[:50]}, amount={pre_checkout.total_amount}, currency={pre_checkout.currency}")
+        
+        # Проверяем, что это наш премиум-счёт
+        if not payload.startswith("premium_"):
+            logger.warning(f"pre_checkout_query: unknown payload {payload[:50]}, rejecting")
+            await pre_checkout.answer(ok=False, error_message="Неверный счёт. Используйте кнопку «Купить Premium» из бота.")
+            return
+        
+        # Подтверждаем оплату
+        await pre_checkout.answer(ok=True)
+        logger.info(f"pre_checkout_query: confirmed for user_id={user_id}")
+    except Exception as e:
+        logger.exception(f"pre_checkout_query error: {e}")
+        # КРИТИЧНО: даже при ошибке нужно ответить Telegram, иначе кнопка не работает
+        try:
+            await pre_checkout.answer(ok=False, error_message="Произошла ошибка. Попробуйте позже.")
+        except Exception:
+            pass
+
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: types.Message):
+    """После успешной оплаты — выдаём премиум."""
+    user_id = message.from_user.id
+    payment = message.successful_payment
+    if not payment:
+        return
+    payload = (payment.invoice_payload or "").strip()
+    if not payload.startswith("premium_"):
+        return
+    set_premium_until(user_id, days=PREMIUM_DAYS)
+    track_event("premium_purchased", user_id, {
+        "amount": payment.total_amount,
+        "currency": payment.currency,
+    })
+    await message.answer(
+        "🎉 <b>Спасибо за покупку!</b>\n\n"
+        f"Премиум активирован на {PREMIUM_DAYS} дней. Теперь вам доступны неограниченные анализы и черновики.",
+        reply_markup=main_menu_keyboard()
+    )
 
 
 @dp.message()
@@ -1204,22 +1289,98 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "@YourCareerAIBot").strip() or "@YourCa
 
 @dp.callback_query(lambda c: c.data == "premium_info")
 async def callback_premium_info(callback: types.CallbackQuery):
-    """Показать информацию о премиум"""
+    """Показать информацию о премиум и кнопку оплаты"""
     user_id = callback.from_user.id
     
-    # Логируем событие: пользователь нажал на премиум
     track_event("premium_clicked", user_id)
     
-    await callback.message.edit_text(
-        "💎 <b>CareerAI Premium - скоро!</b>\n\n"
-        "Мы работаем над запуском премиум-функций.\n"
-        "Оставьте email для уведомления: hello@careerai.bot\n\n"
-        "<i>Ранние подписчики получат скидку 50%!</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
-        ])
+    text = (
+        "💎 <b>CareerAI Premium</b>\n\n"
+        "<b>Что входит в подписку:</b>\n"
+        "✅ Неограниченные анализы резюме (без дневных лимитов)\n"
+        "✅ Генерация черновиков резюме с улучшениями\n"
+        "✅ Оптимизация резюме под конкретную вакансию\n"
+        "✅ Детальный ATS-анализ с рекомендациями\n"
+        "✅ Приоритетная поддержка\n\n"
     )
+    
+    keyboard_buttons = []
+    if PAYMENT_PROVIDER_TOKEN and is_premium(user_id):
+        text += "🎉 <b>У вас активна премиум-подписка.</b> Спасибо!"
+    elif PAYMENT_PROVIDER_TOKEN:
+        # Показываем цену: для USD сумма в центах (999 = 9.99), для RUB в копейках
+        price_label = f"{PREMIUM_PRICE_CENTS / 100:.2f} USD" if PREMIUM_CURRENCY == "USD" else f"{PREMIUM_PRICE_CENTS / 100:.0f} ₽"
+        text += f"<b>Цена:</b> {price_label} за {PREMIUM_DAYS} дней.\n\nОплата прямо в Telegram — картой или через провайдера."
+        keyboard_buttons.append([InlineKeyboardButton(text="💳 Купить Premium", callback_data="buy_premium")])
+    else:
+        text += "Оплата скоро будет доступна. Оставьте email для уведомления: hello@careerai.bot"
+        keyboard_buttons.append([InlineKeyboardButton(text="🔔 Уведомить о запуске", callback_data="notify_launch")])
+    
+    keyboard_buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons))
     await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "buy_premium")
+async def callback_buy_premium(callback: types.CallbackQuery):
+    """Отправить счёт на оплату премиума"""
+    user_id = callback.from_user.id
+    if not PAYMENT_PROVIDER_TOKEN:
+        await callback.answer("Оплата пока не настроена. Попробуйте позже.", show_alert=True)
+        return
+    if is_premium(user_id):
+        await callback.answer("У вас уже есть премиум!", show_alert=True)
+        return
+    
+    bot = get_bot()
+    # payload — внутренний идентификатор (не показывается пользователю), до 128 байт
+    payload = f"premium_{user_id}_{uuid.uuid4().hex[:12]}"
+    title = "CareerAI Premium"
+    description = (
+        f"Премиум-подписка на {PREMIUM_DAYS} дней.\n\n"
+        "Включает:\n"
+        "• Неограниченные анализы резюме\n"
+        "• Генерация черновиков с улучшениями\n"
+        "• Оптимизация под вакансии\n"
+        "• Приоритетная поддержка"
+    )
+    # prices: список из одного элемента; сумма в минимальных единицах (центы для USD, копейки для RUB)
+    prices = [LabeledPrice(label="Premium подписка", amount=PREMIUM_PRICE_CENTS)]
+    
+    try:
+        await bot.send_invoice(
+            chat_id=callback.message.chat.id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token=PAYMENT_PROVIDER_TOKEN,
+            currency=PREMIUM_CURRENCY,
+            prices=prices,
+        )
+        await callback.answer("Счёт отправлен. Проверьте чат.")
+    except Exception as e:
+        err_msg = str(e).strip()
+        # Скрываем возможные фрагменты токена в логах/сообщении
+        if len(PAYMENT_PROVIDER_TOKEN) > 8:
+            err_msg = err_msg.replace(PAYMENT_PROVIDER_TOKEN[:8], "***").replace(PAYMENT_PROVIDER_TOKEN[-4:], "***")
+        logger.exception("Send invoice error: %s", e)
+        await callback.answer("Не удалось отправить счёт. Попробуйте позже.", show_alert=True)
+        # Подсказка в чат (видна в логах Vercel и помогает при отладке)
+        hint = (
+            "⚠️ <b>Ошибка отправки счёта</b>\n\n"
+            f"Код: <code>{type(e).__name__}</code>\n"
+            f"Текст: {html.escape(err_msg[:300])}\n\n"
+            "Проверьте:\n"
+            "• <b>PAYMENT_PROVIDER_TOKEN</b> в Vercel — это токен <b>от BotFather</b> (Payments → YooKassa), не секрет YooKassa из ЛК.\n"
+            "• В BotFather: Payments → выбран YooKassa, вставлен секретный ключ из YooKassa.\n"
+            "• Для YooKassa валюта обычно <b>RUB</b> (PREMIUM_CURRENCY=RUB), сумма в копейках."
+        )
+        try:
+            await callback.message.answer(hint)
+        except Exception:
+            pass
+
+
 
 @dp.callback_query(lambda c: c.data == "notify_launch")
 async def callback_notify_launch(callback: types.CallbackQuery):
@@ -1377,10 +1538,46 @@ def _format_improvements_legacy(items: list) -> str:
 # VERCEL WEBHOOK HANDLER
 # ============================================================================
 
+async def _process_webhook_update(update: dict) -> None:
+    """Обработка одного апдейта (вызов диспетчера). Используется из /api/webhook и /api/webhook-handler."""
+    update_id = update.get("update_id", "N/A")
+    telegram_update = types.Update(**update)
+    b = get_bot()
+    try:
+        await asyncio.wait_for(dp.feed_update(b, telegram_update), timeout=25.0)
+        logger.info(f"Update {update_id} processed successfully")
+    except asyncio.TimeoutError:
+        logger.warning(f"Update {update_id} processing timeout (25s)")
+    except Exception as e:
+        logger.exception(f"Error processing update {update_id}: {type(e).__name__}: {str(e)}")
+
+
+@app.post("/api/webhook-handler")
+async def telegram_webhook_handler_internal(request: Request):
+    """Внутренний обработчик: вызывается Edge-функцией для всех апдейтов кроме pre_checkout_query."""
+    try:
+        update = await request.json()
+        # Прогревочный запрос от cron (update_id 0) — не обрабатываем, сразу 200
+        if update.get("update_id") in (0, "0"):
+            return {"ok": True}
+        await _process_webhook_update(update)
+        return {"ok": True}
+    except Exception as e:
+        logger.exception(f"webhook-handler error: {e}")
+        return {"ok": False}, 500
+
+
 @app.options("/api/webhook")
 async def telegram_webhook_options(request: Request):
     """Обработка OPTIONS-запросов для CORS и ngrok"""
     return {"ok": True}
+
+
+@app.get("/api/webhook")
+async def telegram_webhook_get():
+    """GET для прогрева (cron пингует этот URL). Отвечает 200 в любом случае."""
+    return {"ok": True}
+
 
 @app.post("/api/webhook")
 async def telegram_webhook(request: Request):
@@ -1400,33 +1597,51 @@ async def telegram_webhook(request: Request):
             update_type = "callback_query"
             callback_data = update.get("callback_query", {}).get("data", "")
             logger.info(f"Webhook received: update_id={update_id}, type={update_type}, data={callback_data}")
+        elif "pre_checkout_query" in update:
+            update_type = "pre_checkout_query"
+            pre_checkout = update.get("pre_checkout_query", {})
+            user_id = pre_checkout.get("from", {}).get("id")
+            payload = (pre_checkout.get("invoice_payload") or "").strip()
+            amount = pre_checkout.get("total_amount")
+            currency = pre_checkout.get("currency")
+            pq_id = pre_checkout.get("id")
+            logger.info(f"Webhook pre_checkout_query: update_id={update_id}, user_id={user_id}, payload={payload[:50]}")
+            # КРИТИЧНО: Telegram ждёт ответ ~10 сек. Не вызываем get_bot() — холодный старт
+            # съедает время. Отвечаем Telegram напрямую по HTTP (без aiogram/Bot).
+            # Чтобы не было cold start при оплате — пингуйте /api/health раз в 1–2 мин (cron).
+            if pq_id:
+                token = (os.getenv("BOT_TOKEN") or "").strip()
+                ok = payload.startswith("premium_")
+                err_msg = None if ok else "Неверный счёт. Используйте кнопку «Купить Premium» из бота."
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        body = {"pre_checkout_query_id": pq_id, "ok": ok}
+                        if err_msg:
+                            body["error_message"] = err_msg
+                        r = await client.post(
+                            f"https://api.telegram.org/bot{token}/answerPreCheckoutQuery",
+                            json=body,
+                        )
+                    if r.is_success:
+                        logger.info(f"pre_checkout_query {update_id}: answered ok={ok} (direct HTTP)")
+                    else:
+                        logger.warning(f"pre_checkout_query answer HTTP {r.status_code}: {r.text[:200]}")
+                except Exception as e:
+                    logger.exception(f"pre_checkout_query direct HTTP error: {e}")
+                    if token:
+                        try:
+                            async with httpx.AsyncClient(timeout=5.0) as client:
+                                await client.post(
+                                    f"https://api.telegram.org/bot{token}/answerPreCheckoutQuery",
+                                    json={"pre_checkout_query_id": pq_id, "ok": False, "error_message": "Ошибка. Попробуйте позже."},
+                                )
+                        except Exception:
+                            pass
+            return {"ok": True}
         else:
-            logger.info(f"Webhook received: update_id={update_id}, type={update_type}")
+            logger.info(f"Webhook received: update_id={update_id}, type={update_type}, keys={list(update.keys())}")
         
-        # ВАЖНО: На Vercel serverless функции завершаются сразу после ответа,
-        # поэтому фоновые задачи (create_task) не успевают выполниться.
-        # Обрабатываем обновление синхронно, но быстро отвечаем Telegram.
-        telegram_update = types.Update(**update)
-        b = get_bot()
-        
-        # Запускаем обработку в фоне, но ждем её завершения
-        # Используем asyncio.wait_for с таймаутом, чтобы не блокировать слишком долго
-        try:
-            # Обрабатываем с таймаутом 25 секунд (Vercel Pro план дает до 60 сек)
-            await asyncio.wait_for(
-                dp.feed_update(b, telegram_update),
-                timeout=25.0
-            )
-            logger.info(f"Update {update_id} processed successfully")
-        except asyncio.TimeoutError:
-            logger.warning(f"Update {update_id} processing timeout (25s)")
-            # Если обработка заняла слишком долго, всё равно отвечаем Telegram успешно
-            # чтобы не получить повторную отправку
-        except Exception as e:
-            logger.exception(f"Error processing update {update_id}: {type(e).__name__}: {str(e)}")
-            # Продолжаем выполнение, чтобы вернуть успешный ответ Telegram
-        
-        # Возвращаем успешный ответ Telegram
+        await _process_webhook_update(update)
         return {"ok": True}
     except ValueError as e:
         # Ошибки валидации данных от Telegram
@@ -1454,26 +1669,47 @@ async def root():
 @app.get("/api/health")
 async def health_check():
     """Health check для мониторинга"""
-    return {
-        "status": "healthy",
-        "users": len(user_data),
-        "timestamp": _now().isoformat(),
-        "version": APP_VERSION,
-    }
+    try:
+        return {
+            "status": "healthy",
+            "users": len(user_data),
+            "timestamp": _now().isoformat(),
+            "version": APP_VERSION,
+        }
+    except Exception as e:
+        logger.exception("health_check error")
+        return {
+            "status": "degraded",
+            "error": str(e),
+            "version": APP_VERSION,
+        }
+
+def _stats_response():
+    """Общая логика ответа для /api/stats и /stats"""
+    try:
+        stats = get_analytics_stats()
+        return {
+            "status": "ok",
+            "analytics": stats,
+            "note": "Данные хранятся в памяти и сбрасываются при перезапуске сервера"
+        }
+    except Exception as e:
+        logger.exception("_stats_response error")
+        return {
+            "status": "error",
+            "error": str(e),
+            "analytics": {},
+        }
 
 @app.get("/api/stats")
 async def analytics_stats():
-    """
-    Эндпоинт для просмотра аналитики
-    
-    Доступен по адресу: https://careeraibot.vercel.app/api/stats
-    """
-    stats = get_analytics_stats()
-    return {
-        "status": "ok",
-        "analytics": stats,
-        "note": "Данные хранятся в памяти и сбрасываются при перезапуске сервера"
-    }
+    """Эндпоинт для просмотра аналитики: https://careeraibot.vercel.app/api/stats"""
+    return _stats_response()
+
+@app.get("/stats")
+async def analytics_stats_alt():
+    """Альтернативный URL (на случай если /api/stats не доходит): https://careeraibot.vercel.app/stats"""
+    return _stats_response()
 
 # ============================================================================
 # MAIN (для локального тестирования)

@@ -17,11 +17,17 @@ except Exception as e:
     # Если импорт не удался, создаем простой app для диагностики
     from fastapi import FastAPI
     app = FastAPI()
-    
+    _import_error = str(e)
+
     @app.get("/")
     async def error():
-        return {"error": f"Failed to import main app: {str(e)}"}
-    
+        return {"error": f"Failed to import main app: {_import_error}"}
+
     @app.get("/api/health")
     async def health():
-        return {"error": f"Failed to import main app: {str(e)}"}
+        return {"status": "error", "error": _import_error}
+
+    @app.get("/stats")
+    @app.get("/api/stats")
+    async def stats_fallback():
+        return {"status": "error", "error": _import_error, "analytics": {}}
