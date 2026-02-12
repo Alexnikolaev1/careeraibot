@@ -1347,16 +1347,44 @@ async def callback_buy_premium(callback: types.CallbackQuery):
     # prices: список из одного элемента; сумма в минимальных единицах (центы для USD, копейки для RUB)
     prices = [LabeledPrice(label="Premium подписка", amount=PREMIUM_PRICE_CENTS)]
     
+    # 54-ФЗ: при «Чеки от ЮKassa» в sendInvoice ОБЯЗАТЕЛЬНО передавать provider_data с receipt,
+    # иначе платёж не пройдёт («Payment failed»). Документация: yookassa.ru/docs/support/payments/onboarding/.../telegram
+    provider_data_obj: Optional[dict] = None
+    if PREMIUM_CURRENCY == "RUB":
+        receipt_amount = f"{PREMIUM_PRICE_CENTS / 100:.2f}"
+        provider_data_obj = {
+            "receipt": {
+                "customer": {"email": "receipt@example.com"},  # Заменится email из формы оплаты (need_email)
+                "items": [
+                    {
+                        "description": "Премиум-подписка CareerAI",
+                        "quantity": 1.0,
+                        "amount": {"value": receipt_amount, "currency": "RUB"},
+                        "vat_code": 1,
+                        "payment_mode": "full_prepayment",
+                        "payment_subject": "service",
+                    }
+                ],
+                "internet": "true",
+                "timezone": 2,
+            }
+        }
+    
+    send_kw: dict = {
+        "chat_id": callback.message.chat.id,
+        "title": title,
+        "description": description,
+        "payload": payload,
+        "provider_token": PAYMENT_PROVIDER_TOKEN,
+        "currency": PREMIUM_CURRENCY,
+        "prices": prices,
+    }
+    if provider_data_obj:
+        send_kw["provider_data"] = json.dumps(provider_data_obj)
+        send_kw["need_email"] = True
+        send_kw["send_email_to_provider"] = True
     try:
-        await bot.send_invoice(
-            chat_id=callback.message.chat.id,
-            title=title,
-            description=description,
-            payload=payload,
-            provider_token=PAYMENT_PROVIDER_TOKEN,
-            currency=PREMIUM_CURRENCY,
-            prices=prices,
-        )
+        await bot.send_invoice(**send_kw)
         await callback.answer("Счёт отправлен. Проверьте чат.")
     except Exception as e:
         err_msg = str(e).strip()
